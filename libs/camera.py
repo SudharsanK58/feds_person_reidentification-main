@@ -33,8 +33,8 @@ class VideoCamera:
             self.cap = cv2.VideoCapture(self.input_stream)
 
         # 🔥 Force Resolution to 1080p (1920x1080)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
         # Optional: Improve Smoothness by Setting FPS
         self.cap.set(cv2.CAP_PROP_FPS, 30)
@@ -52,10 +52,6 @@ class VideoCamera:
             )
             os._exit(1)
 
-        # Removed resizing logic to ensure full 1080p resolution
-        if self.frame.shape[1] != 1920:
-            self.frame = cv2.resize(self.frame, (1920, 1080))
-
     def __del__(self):
         self.cap.release()
 
@@ -72,11 +68,7 @@ class VideoCamera:
 
         if frame is None:
             return frame
-
-        # Ensure frame stays at 1080p, no resizing required
-        if frame.shape[1] != 1920:
-            frame = cv2.resize(frame, (1920, 1080))
-
+        
         if ret:
             if self.input_stream == 0 and flip_code is not None:
                 frame = cv2.flip(frame, int(flip_code))
