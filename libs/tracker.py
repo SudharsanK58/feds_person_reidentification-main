@@ -50,35 +50,73 @@ DELETED = 3
 # Dictionary to track which IDs should be green
 green_tagged_ids = set()
 
+# Define the expected MQTT payloads and their corresponding section indices
+PAYLOAD_SECTION_MAP = {
+    "201010#Sudharsan#3#12345678#0-3 feet": 0,
+    "201010#Sudharsan#3#12345678#3-6 feet": 1,
+    "201010#Sudharsan#3#12345678#6-9 feet": 2,
+    "201010#Sudharsan#3#12345678#9-12 feet": 3,
+}
+
+
 # MQTT Callbacks
 def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT server with result code {rc}")
+    # Subscribe to the specific topic
     client.subscribe("04:e9:e5:16:f7:1b/nfc")
 
 def on_message(client, userdata, msg):
     global green_tagged_ids
     data = msg.payload.decode().strip()
+    print(f"Received data: {data}")
 
-    # Verify if the received data starts with "201"
-    if data.startswith("201"):
-        print(f"Received valid data: {data}")
-        
+    # Check if the received data is one of the expected payloads
+    if data in PAYLOAD_SECTION_MAP:
+        print(f"Received expected payload: {data}")
+
+        # Get the corresponding section index from the map
+        target_section_index = PAYLOAD_SECTION_MAP[data]
+
         # Access the tracker instance correctly
         tracker = userdata['tracker']
 
+        # Get the segment width calculated by the tracker
+        segment_width = tracker.segment_width
+        frame_w = tracker.frame_w
+
+        # Calculate the x-coordinate range for the target section
+        min_x = target_section_index * segment_width
+        # The max_x for the last section should go up to the frame width
+        max_x = (target_section_index + 1) * segment_width
+        if target_section_index == tracker.num_distance_sections - 1: # Check if it's the last section
+             max_x = frame_w
+
+        print(f"Checking for persons in section index {target_section_index} (x range: {min_x} to {max_x})")
+
         # Iterate through all active tracks
         for track in tracker.tracks:
-            if track.stats == CONFIRMED:  # Only consider confirmed tracks
-                # Correctly retrieve the person's bounding box center
-                center = tracker.get_center(tracker.track_boxes[track.track_id][-1])
+            # Only consider confirmed tracks that have been assigned an ID
+            if track.stats == CONFIRMED and track.person_id is not None:
+                # Get the last known position of the track
+                # Ensure track_points is not empty
+                if tracker.track_points[track.track_id]:
+                    center = tracker.track_points[track.track_id][-1] # (x, y) coordinate
 
-                # Check if the detected person is inside the yellow box
-                if is_inside_center_box(center, tracker.frame, box_size=250):
-                    green_tagged_ids.add(track.person_id)
-                    print(f"Person ID {track.person_id} tagged as GREEN")
-                else:
-                    print(f"Person ID {track.person_id} is NOT inside the yellow box")
+                    # Check if the person's center is inside the target section
+                    # The x-coordinate must be within the calculated range (inclusive)
+                    if min_x <= center[0] <= max_x:
+                        # Condition 1: Person is in the correct section
+                        # Condition 2: MQTT payload matched (checked by the outer if)
 
+                        # If both conditions are met, tag this person ID as green
+                        green_tagged_ids.add(track.person_id)
+                        print(f"Person ID {track.person_id} tagged as GREEN (in section {target_section_index} and MQTT matched)")
+                    # else:
+                    #     print(f"Person ID {track.person_id} is NOT inside the target section ({target_section_index})")
+                # else:
+                #      print(f"Track {track.track_id} has no track points.")
+    # else:
+    #     print(f"Received unexpected payload: {data}")
 
 
 # MQTT Initialization
@@ -92,18 +130,6 @@ def start_mqtt(tracker):
     mqtt_thread = Thread(target=mqtt_client.loop_forever)
     mqtt_thread.start()
 
-
-def is_inside_center_box(center, frame, box_size=250):
-    """
-    Checks if the given center point (x,y) is inside the center box of size box_size x box_size.
-    """
-    frame_h, frame_w = frame.shape[:2]
-    center_x = frame_w // 2
-    center_y = frame_h // 2
-    half_box = box_size // 2
-    top_left = (center_x - half_box, center_y - half_box)
-    bottom_right = (center_x + half_box, center_y + half_box)
-    return (top_left[0] <= center[0] <= bottom_right[0]) and (top_left[1] <= center[1] <= bottom_right[1])
 
 class Person:
     pass
@@ -165,6 +191,11 @@ class Tracker:
         self.grid, self.enable_count = self._set_grid(grid)
         self.track_range = self._set_track_range(frame, self.grid)
         self.m = Munkres()
+
+        # Calculate and store segment width for distance lines
+        self.num_distance_sections = 4 # 0-3, 3-6, 6-9, 9-12
+        self.segment_width = self.frame_w // self.num_distance_sections
+
 
     def _next_id(self):
         self.person_id += 1
@@ -297,6 +328,8 @@ class Tracker:
         # End     : center coordinate when person re-identification ended
         # boundary: counter boundary coordinate which "_set_track_range" defined
         track_points = self.track_points[track_id]
+        if not track_points: # Handle empty track points list
+             return False
         start_tmp = track_points[0]
         end_tmp = track_points[-1]
         corner_name, count_direction = direction_corner_dict[direction]
@@ -394,23 +427,25 @@ class Tracker:
         track = self.tracks[track_id]
 
         # If the track's ID is in the green_tagged_ids list, make it green
-        if track.person_id in green_tagged_ids:
+        if track.person_id is not None and track.person_id in green_tagged_ids:
             color = green
         else:
             color = red
 
         # Draw ID on the detected person
-        x = self.track_points[track_id][-1][0]
-        y = self.track_points[track_id][-1][1]
-        cv2.putText(
-            frame,
-            str(track.person_id),
-            (int(x), int(y)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-        )
+        # Ensure track_points is not empty before accessing the last element
+        if self.track_points[track_id]:
+            x = self.track_points[track_id][-1][0]
+            y = self.track_points[track_id][-1][1]
+            cv2.putText(
+                frame,
+                str(track.person_id),
+                (int(x), int(y)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
 
         xmin, ymin, xmax, ymax = box
         ymax += 30
@@ -449,25 +484,76 @@ class Tracker:
             return frame
 
         # Get person's color for draw rectrangle and tracked points
-        color = self.get_color(track.person_id)
+        # color is now determined inside draw_reid_box based on green_tagged_ids
+        # We still call get_color here, but the actual color used for the box
+        # is decided in draw_reid_box. Let's get the color for the track points.
+        track_point_color = green if track.person_id is not None and track.person_id in green_tagged_ids else self.get_color(track.person_id)
+
 
         # Set similarity as confidence
         conf = f"{track.person_id}" if confidence else "lost.."
 
-        # Draw reid box
-        frame = self.draw_reid_box(frame, track_id, box, conf, color)
+        # Draw reid box (color determined inside this function)
+        frame = self.draw_reid_box(frame, track_id, box, conf, track_point_color) # Pass track_point_color, though draw_reid_box recalculates it
 
         # Draw track porints
         tp = np.array(self.track_points[track_id])
         track_points = tp[~np.isnan(tp).any(axis=1)].astype(int)
         if len(track_points) > 2:
-            frame = self.draw_track_points(frame, track_points, color)
+            # Use the color determined for track points
+            frame = self.draw_track_points(frame, track_points, track_point_color)
 
         # Count a person by the direction when the person is out of counter area
         if track_points.any():
             if self.enable_count and self.is_out_of_track_area(track_points[-1]):
                 self.count_person(track_id)
         return frame
+
+    def draw_distance_lines(self, frame):
+        """Draws 3 vertical lines (invisibly) and distance labels for 4 sections on the frame."""
+        frame_h, frame_w = frame.shape[:2]
+        num_sections = self.num_distance_sections # Use the stored attribute
+        num_lines = num_sections - 1 # This means 3 lines
+        segment_width = self.segment_width # Use the stored attribute
+
+        # line_color = (0, 255, 255) # Yellow in BGR - No longer used for drawing lines
+        # line_thickness = 1 # No longer used for drawing lines
+
+        labels = ["0-3 Feet", "3-6 Feet", "6-9 Feet", "9-12 Feet"]
+        label_color = (255, 255, 255) # White
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        label_y_offset = 20 # Pixels from the top
+
+        # Draw the 3 lines (commented out to make them "transparent")
+        # for i in range(num_lines):
+        #     line_x = (i + 1) * segment_width
+        #     pt1 = (line_x, 0)
+        #     pt2 = (line_x, frame_h)
+        #     cv2.line(frame, pt1, pt2, line_color, line_thickness)
+
+        # Draw the labels for the 4 sections
+        for i in range(num_sections):
+            label_text = labels[i]
+            # Calculate text size to center it
+            (text_w, text_h), baseline = cv2.getTextSize(label_text, font, font_scale, font_thickness)
+            # Center of section i is between i*segment_width and (i+1)*segment_width
+            section_center_x = (i * segment_width) + segment_width // 2
+            label_x = section_center_x - text_w // 2
+            label_org = (label_x, label_y_offset + text_h) # Place text baseline at y_offset + text_h
+
+            # Ensure label is not drawn outside the frame (especially horizontally)
+            label_org = (max(0, label_x), label_y_offset + text_h)
+            # Also ensure it doesn't go past the right edge
+            if label_org[0] + text_w > frame_w:
+                 label_org = (frame_w - text_w, label_org[1])
+
+
+            cv2.putText(frame, label_text, label_org, font, font_scale, label_color, font_thickness)
+
+        return frame
+
 
     def first_detection(self, feature_vecs, boxes):
 
@@ -494,6 +580,8 @@ class Tracker:
     def get_color(self, person_id: int) -> tuple:
         # Difine person's color from Pallete (self.colors) with 100 colors.
         # The 100th person_id will use the first index's color again.
+        if person_id is None: # Handle case before person_id is assigned
+             return (0,0,0) # Default color like black
         color_id = person_id - len(self.colors) * (person_id // len(self.colors))
         return self.colors[color_id]
 
@@ -519,8 +607,13 @@ class Tracker:
 
         # 3. Get distance between dettected box and track box
         # and check if thease boxes are at the closest to location in last track points.
-        track_point = np.array(self.track_points[track_id][-1]).reshape(-1, 2)
-        euc_dist = get_euclidean_distance(center, track_point).item(0)
+        # Ensure track_points is not empty before accessing the last element
+        if not self.track_points[track_id]:
+             euc_dist = 0.0 # Or some default/error value
+        else:
+            track_point = np.array(self.track_points[track_id][-1]).reshape(-1, 2)
+            euc_dist = get_euclidean_distance(center, track_point).item(0)
+
 
         # 5. Get box iou between detected box and track box
         track_box = self.track_boxes[track_id][-1]
@@ -551,8 +644,9 @@ class Tracker:
 
     def solve_occlusion_problem(self, frame, det_id, detection, boxes):
         # If a detected box is overlapped with the other boxes, draw skyblue box over them.
-        del boxes[det_id]
-        if self.is_overlapped(detection.box, boxes):
+        # Create a temporary list excluding the current box for overlap check
+        temp_boxes = boxes[:det_id] + boxes[det_id+1:]
+        if self.is_overlapped(detection.box, temp_boxes):
             # Draw skyblue ractangle over the detected person
             frame = self.draw_det_box(frame, det_id, detection.box, color=(255, 255, 0))
             return frame, True
@@ -575,7 +669,7 @@ class Tracker:
             min, max = stats.norm.interval(alpha=0.99, loc=mean, scale=std)
         else:
             mean, std = 0.0, 0.0
-            min, max = 0.0, detection.box_w
+            min, max = 0.0, detection.box_w # Use box width as a fallback max distance
 
         # Memo: After all, if the Euclidean distance is smaller than the width of the bbox,
         # the distance is considered valid.
@@ -639,14 +733,16 @@ class Tracker:
 
         # 2. Update bouding box
         # *Replace* predicted box added in preprocess with detected person box
-        self.track_boxes[track_id].pop(-1)
+        if self.track_boxes[track_id]: # Ensure list is not empty before popping
+            self.track_boxes[track_id].pop(-1)
         self.track_boxes[track_id].append(detection.box)
 
         # 3. Apply kalmanfilter and update a track point
         center = detection.center
 
         # *Replace* predicted center added in preprocess with filtered person center
-        self.track_points[track_id].pop(-1)
+        if self.track_points[track_id]: # Ensure list is not empty before popping
+            self.track_points[track_id].pop(-1)
         center, _ = self.kalman_filter(track_id, center, update=True)
         self.track_points[track_id].append(center)
 
@@ -675,16 +771,32 @@ class Tracker:
             logger.debug(message)
             return
 
-        # if track exists (before a person is registered)
-        if self.tracks[detection.track_id]:
-            self.tracks[detection.track_id].lost()
-
-        # Register as a new person
-        # if box_iou between detected box and reid box is lower than box_iou_thld
+        # Register as a new person if the match was poor AND the box doesn't overlap well
         if not detection.is_valid_iou:
-            message = f"frame_id:{self.frame_id} det_id:{det_id} track_id:{detection.track_id} box_iou:{detection.box_iou}"
+            message = f"frame_id:{self.frame_id} det_id:{det_id} track_id:{detection.track_id} box_iou:{detection.box_iou} - Registering as new person"
             logger.debug(message)
-            self.register_person(det_id, detection)
+            # Create a *new* track for this detection
+            center = self.get_center(detection.box)
+            self.track_points.append([center])
+            self.track_points_measured.append([center])
+            # Need to append the feature vector to self.track_vecs
+            if self.track_vecs is None:
+                 self.track_vecs = detection.feature_vec
+            else:
+                 self.track_vecs = np.vstack((self.track_vecs, detection.feature_vec))
+            self.track_boxes.append([detection.box])
+            self.euc_distances.append([0.0])
+            new_track_id = len(self.tracks) # Get the next available track_id
+            self.tracks.append(Track(new_track_id, center))
+            logger.info(f"frame_id:{self.frame_id} Registered new person from det_id:{det_id} to new track_id:{new_track_id}")
+        else:
+             # If match was poor but box_iou was high, it might be the same person but
+             # the re-id feature vector was bad, or the distance metric failed.
+             # In this case, we don't register a new person, and the original track
+             # (detection.track_id) will be marked as lost in the main loop.
+             message = f"frame_id:{self.frame_id} det_id:{det_id} track_id:{detection.track_id} box_iou:{detection.box_iou} - Match failed, but high IoU. Not registering new person."
+             logger.debug(message)
+
 
     def lost(self, frame, track):
         # 1. Disable tracking when lost counter exceeded lost thld
@@ -698,8 +810,15 @@ class Tracker:
 
         # 3. draw tracking information into the frame excluding tentative track
         if track.stats == CONFIRMED:
-            pred_box = self.track_boxes[track.track_id][-1]
-            frame = self.draw_track_info(frame, track_id, box=pred_box, confidence=None)
+            # Ensure track_boxes is not empty before accessing the last element
+            if self.track_boxes[track.track_id]:
+                pred_box = self.track_boxes[track.track_id][-1]
+                frame = self.draw_track_info(frame, track_id, box=pred_box, confidence=None)
+            else:
+                 # If track_boxes is empty, maybe just draw the track points if available
+                 if self.track_points[track_id]:
+                      # This case might need specific drawing logic if no box is available
+                      pass # For now, do nothing if no box to draw
 
         return frame
 
@@ -717,10 +836,16 @@ class Tracker:
             self.track_points[track_id].append(center)
 
             # Predict box from previous person boxes
-            prev_box = self.track_boxes[track_id][-1]
-            box = get_box_coordinates(prev_box, center)
-            box = np.array(box, dtype=int)
-            self.track_boxes[track_id].append(tuple(box))
+            # Ensure track_boxes is not empty before accessing the last element
+            if self.track_boxes[track_id]:
+                prev_box = self.track_boxes[track_id][-1]
+                box = get_box_coordinates(prev_box, center)
+                box = np.array(box, dtype=int)
+                self.track_boxes[track_id].append(tuple(box))
+            else:
+                 # If no previous box, append a placeholder or handle differently
+                 self.track_boxes[track_id].append((np.nan, np.nan, np.nan, np.nan))
+
 
             # Disable the track when the center predicted by kalmanfilter is out of frame
             if self.is_out_of_frame(center):
@@ -754,34 +879,36 @@ class Tracker:
         if not person_frames and not active_track_ids:
             frame = self.draw_params(frame)
             frame = self.draw_counter_stats(frame)
+            frame = self.draw_distance_lines(frame) # Draw lines even with no detections/tracks
             return frame
 
         if not person_frames and active_track_ids:
             for track_id in active_track_ids:
                 track = self.tracks[track_id]
                 frame = self.lost(frame, track)
+            frame = self.draw_params(frame)
+            frame = self.draw_counter_stats(frame)
+            frame = self.draw_distance_lines(frame) # Draw lines
             return frame
 
         # The first feature vectors registration
         feature_vecs = self.get_feature_vecs(person_frames[:reid_limit])
         if self.track_vecs is None:
             self.first_detection(feature_vecs, boxes)
+            # After first detection, draw info and lines
+            for track_id in range(len(self.tracks)):
+                 track = self.tracks[track_id]
+                 # Draw info for newly created tracks (they are TENTATIVE)
+                 # draw_track_info only draws CONFIRMED, so this won't draw boxes yet.
+                 # If you want to draw TENTATIVE boxes, modify draw_track_info or add new logic here.
+                 # For now, let's rely on the main loop drawing after confirmation.
+                 pass # No drawing needed immediately after first_detection
 
-        # Register detected person and return the frame when there are no active tracks.
-        if not active_track_ids:
-            for det_id in range(len(boxes)):
-                box, center, feature_vec = self.get_box_info(
-                    det_id, boxes, feature_vecs
-                )
-                if not self.is_out_of_track_area(center):
-                    self.track_points.append([center])
-                    self.track_points_measured.append([center])
-                    self.track_vecs = np.vstack((self.track_vecs, feature_vec))
-                    self.track_boxes.append([box])
-                    self.euc_distances.append([0.0])
-                    track_id = len(self.tracks)
-                    self.tracks.append(Track(track_id, center))
+            frame = self.draw_params(frame)
+            frame = self.draw_counter_stats(frame)
+            frame = self.draw_distance_lines(frame) # Draw lines
             return frame
+
 
         # ----------- Preprocess -------------------- #
         frame_id = f"frame_id:{self.frame_id}"
@@ -789,50 +916,92 @@ class Tracker:
         # Cost Matrix
         # Compare the cosine similarity between the detected person's feature vectors and
         # the retained feature vectors
-        similarities = cos_similarity(feature_vecs, self.track_vecs[active_track_ids])
-        similarities[np.isnan(similarities)] = 0
-        if similarities.size < 1:
-            similarities = np.zeros((len(feature_vecs), len(self.track_vecs)))
-        # Get the min cost(distance) from cos similarity
-        cost_matrix = 1 - similarities
+        # Ensure self.track_vecs[active_track_ids] is not empty if active_track_ids is not empty
+        if active_track_ids and self.track_vecs is not None and self.track_vecs[active_track_ids].shape[0] > 0:
+             similarities = cos_similarity(feature_vecs, self.track_vecs[active_track_ids])
+             similarities[np.isnan(similarities)] = 0
+        else:
+             # If no active tracks with valid vectors, similarities matrix is empty
+             similarities = np.zeros((len(feature_vecs), 0))
+
+
+        if similarities.size < 1 and (len(feature_vecs) > 0 or len(active_track_ids) > 0):
+             # Handle case where one dimension is zero, Munkres might fail
+             # If there are detections but no active tracks, or vice versa,
+             # the cost matrix will be non-square or have a zero dimension.
+             # Munkres expects a cost matrix where rows = detections, columns = tracks.
+             # If detections > 0 and active_tracks == 0, Munkres should assign all detections to 'no track'.
+             # If detections == 0 and active_tracks > 0, Munkres should assign 'no detection' to all tracks.
+             # If both are 0, the earlier check handles it.
+             # If detections > 0 and active_tracks > 0 but similarities is empty (e.g., all NaN),
+             # Munkres will compute on a zero matrix, assigning detections to tracks arbitrarily.
+             # Let's ensure cost_matrix has the correct shape for Munkres even if similarities is empty.
+             cost_matrix = np.ones((len(feature_vecs), len(active_track_ids))) # High cost for all assignments
+        else:
+             # Get the min cost(distance) from cos similarity
+             cost_matrix = 1 - similarities
+
 
         # Box IoU Matrix
         # To account for uncertainty in the shape of bounding boxes, halve the cost of
         # IOU and add it to the cost matrix.
-        track_boxes = np.array(self.track_boxes, dtype=object)[active_track_ids]
-        track_boxes = np.array([box[-1] for box in track_boxes])
-        box_iou_matrix = np.zeros((len(feature_vecs), len(active_track_ids)))
-        for i, box in enumerate(boxes):
-            box_iou_matrix[i, :] = get_iou2(box, track_boxes)
-        box_iou_matrix = (1 - box_iou_matrix) * 0.5
-        cost_matrix = cost_matrix + box_iou_matrix
+        # Ensure track_boxes is not empty for active tracks
+        if active_track_ids and self.track_boxes and all(self.track_boxes[tid] for tid in active_track_ids):
+            track_boxes_active = np.array(self.track_boxes, dtype=object)[active_track_ids]
+            track_boxes_last = np.array([box[-1] for box in track_boxes_active])
+            box_iou_matrix = np.zeros((len(feature_vecs), len(active_track_ids)))
+            for i, box in enumerate(boxes):
+                box_iou_matrix[i, :] = get_iou2(box, track_boxes_last)
+            box_iou_matrix = (1 - box_iou_matrix) * 0.5
+            # Ensure cost_matrix and box_iou_matrix have compatible shapes before adding
+            if cost_matrix.shape == box_iou_matrix.shape:
+                 cost_matrix = cost_matrix + box_iou_matrix
+            else:
+                 # If shapes don't match (e.g., one dimension was zero), skip adding IoU cost
+                 logger.warning(f"Cost matrix shape {cost_matrix.shape} and IoU matrix shape {box_iou_matrix.shape} mismatch. Skipping IoU cost.")
+        elif len(feature_vecs) > 0 and len(active_track_ids) > 0:
+             # If there are detections and active tracks, but no valid track boxes,
+             # cost_matrix is already initialized with high costs. No IoU cost added.
+             pass
+        else:
+             # If either detections or active tracks are zero, cost_matrix is already handled.
+             pass
+
 
         # Solve Assignment problem
-        track_ids = np.array(self.m.compute(cost_matrix.tolist()))[:, 1]
-        confidences = [
-            similarities[det_id][track_id] for det_id, track_id in enumerate(track_ids)
-        ]
+        # Munkres requires cost_matrix to have at least one dimension > 0
+        if cost_matrix.shape[0] > 0 and cost_matrix.shape[1] > 0:
+            assignments = self.m.compute(cost_matrix.tolist())
+            track_ids_assigned = [active_track_ids[col] for row, col in assignments]
+            det_ids_assigned = [row for row, col in assignments]
+            confidences_assigned = [similarities[row][col] for row, col in assignments]
+        else:
+            assignments = []
+            track_ids_assigned = []
+            det_ids_assigned = []
+            confidences_assigned = []
 
-        # Re-index track_ids with active_track_ids
-        if active_track_ids:
-            track_ids = [active_track_ids[i] for i in track_ids]
 
         update_detection_dict, not_found_detection_dict = {}, {}
+        assigned_det_ids = set(det_ids_assigned)
+        assigned_track_ids = set(track_ids_assigned)
 
-        # ------- ReIdentification Loop  ------------ #
-        for det_id, track_id in enumerate(track_ids):
+        # Process assigned detections
+        for i, det_id in enumerate(det_ids_assigned):
+            track_id = track_ids_assigned[i]
+            confidence = confidences_assigned[i]
 
             # get "detected" person's information
             detection = self.get_person_info(
-                det_id, track_id, confidences, boxes, feature_vecs
+                det_id, track_id, confidences_assigned, boxes, feature_vecs
             )
             # track a copy(snapshot) of  tracked person's information
-            tracks = self.tracks.copy()
-            track = tracks[track_id]
+            # tracks = self.tracks.copy() # No need for a copy here, work directly on self.tracks
+            track = self.tracks[track_id] # Get the actual track object
 
             # solve occlustion problem
             # skip update process if detected box and reidentificated box are overlapped.
-            boxes_ = boxes.copy()
+            boxes_ = boxes.copy() # Need a copy to safely remove one element for the check
             frame, result = self.solve_occlusion_problem(
                 frame, det_id, detection, boxes_
             )
@@ -840,7 +1009,10 @@ class Tracker:
             if result:
                 message = f"{frame_id} occlusion det_id:{det_id} person_id:{track.person_id}(track_id:{track_id})"
                 logger.info(message)
-                continue
+                # Mark the assigned track as matched even if occluded, so it doesn't get lost immediately?
+                # Or should occlusion prevent matching? The original code skipped the rest of the loop,
+                # meaning the track's is_matched would remain False. Let's keep that behavior.
+                continue # Skip evaluation and update for this detection
 
             # Evaluate ID assignment
             update = self.evaluate(detection)
@@ -848,23 +1020,79 @@ class Tracker:
             if update or detection.confidence > sim_thld:
                 detection.update = "update"
                 update_detection_dict[det_id] = detection
+                track.is_matched = True # Mark the track as matched
             else:
                 detection.update = "not_found"
                 not_found_detection_dict[det_id] = detection
+                # Do NOT mark track.is_matched = True here, as the match was poor.
 
-        # Update
+        # Process detections that were NOT assigned by Munkres (shouldn't happen if cost matrix is full?)
+        # Munkres assigns every row to a column if possible. If detections > tracks, some detections won't be assigned.
+        # If tracks > detections, some tracks won't be assigned.
+        # Let's handle detections not assigned to *active* tracks.
+        # These should be considered potential new persons.
+        all_det_ids = set(range(len(boxes)))
+        unassigned_det_ids = all_det_ids - assigned_det_ids
+
+        for det_id in unassigned_det_ids:
+             # These detections didn't get a good match via Munkres.
+             # Treat them as potential new persons.
+             # Create a dummy detection object for logging/processing
+             box, center, feature_vec = self.get_box_info(det_id, boxes, feature_vecs)
+             detection = Person()
+             detection.track_id = -1 # Indicate no assigned track
+             detection.confidence = 0 # No match confidence
+             detection.feature_vec = feature_vec
+             detection.box = box
+             detection.box_w = box[2] - box[0]
+             detection.box_h = box[3] - box[1]
+             detection.center = center
+             detection.euc_dist = float('inf') # High distance
+             detection.box_iou = 0 # Assume low IoU with any existing track if unassigned
+
+             detection.update = "unassigned"
+             # Check if this unassigned detection should become a new track
+             # Similar logic to the 'not_found' case, but it's definitely a new person.
+             if not self.is_out_of_track_area(detection.center):
+                 message = f"frame_id:{self.frame_id} det_id:{det_id} unassigned - Registering as new person"
+                 logger.debug(message)
+                 # Create a *new* track for this detection
+                 self.track_points.append([center])
+                 self.track_points_measured.append([center])
+                 # Need to append the feature vector to self.track_vecs
+                 if self.track_vecs is None:
+                      self.track_vecs = detection.feature_vec
+                 else:
+                      self.track_vecs = np.vstack((self.track_vecs, detection.feature_vec))
+                 self.track_boxes.append([box])
+                 self.euc_distances.append([0.0])
+                 new_track_id = len(self.tracks) # Get the next available track_id
+                 self.tracks.append(Track(new_track_id, center))
+                 logger.info(f"frame_id:{self.frame_id} Registered new person from unassigned det_id:{det_id} to new track_id:{new_track_id}")
+             else:
+                 message = f"frame_id:{self.frame_id} det_id:{det_id} unassigned - Out of counter area, not registering."
+                 logger.debug(message)
+
+
+        # Update assigned detections that passed evaluation
         for det_id, detection in update_detection_dict.items():
             frame = self.update(frame, detection)
             self.show_log(det_id, detection)
 
-        # Not found detections (register person)
+        # Process assigned detections that failed evaluation ("not_found")
+        # These were assigned to an existing track but the match was poor.
+        # The not_found method now decides whether to register a *new* person
+        # based on box_iou.
         for det_id, detection in not_found_detection_dict.items():
             self.not_found(det_id, detection)
             self.show_log(det_id, detection)
 
+
         # Lost tracks
+        # These are active tracks that were NOT assigned a detection by Munkres
+        # OR were assigned a detection but the match was poor (is_matched is False).
         lost_track_ids = [
-            t.track_id for t in tracks if t.stats != DELETED and not t.is_matched
+            t.track_id for t in self.tracks if t.stats != DELETED and not t.is_matched
         ]
         for track_id in lost_track_ids:
             track = self.tracks[track_id]
@@ -874,8 +1102,13 @@ class Tracker:
         # After the loops, draw the other information into the frame
         frame = self.draw_counter_stats(frame)
         frame = self.draw_params(frame)
+        frame = self.draw_distance_lines(frame) # Draw the new lines and labels
 
         # preserv feature vectors which is used in the register_person function
+        # This seems to be preserving the feature vectors of the *current* frame's detections,
+        # not the track vectors. The variable names are a bit confusing here.
+        # Assuming the intent is to keep the *last processed* detection info for some reason, keep it.
+        # If the intent was to update the track vectors, that happens in self.update.
         self.prev_feature_vecs = feature_vecs
         self.prev_track_boxes = boxes
 
@@ -883,11 +1116,22 @@ class Tracker:
 
     def show_log(self, det_id, detection):
         frame_id = f"frame_id:{self.frame_id}"
-        track = self.tracks[detection.track_id]
-        header = f"{detection.update} det_id:{det_id} to person_id:{track.person_id}(track_id:{detection.track_id}) sim:{detection.confidence:.3f}"
-        info1 = f"euc_dist:{detection.is_valid_dist}({detection.euc_dist:.3f}) {detection.euc_dist_min:.3f} < {detection.euc_dist:.3f} < {detection.euc_dist_max:.3f}({detection.box_w}) euc_dist_mean:{detection.euc_dist_mean:.3f} euc_dist_std:{detection.euc_dist_std:.3f}"
+        # Handle cases where detection.track_id might be -1 (unassigned)
+        track_info = f"track_id:{detection.track_id}"
+        person_info = "person_id:N/A"
+        if detection.track_id != -1 and detection.track_id is not None and detection.track_id < len(self.tracks):
+             track = self.tracks[detection.track_id]
+             person_info = f"person_id:{track.person_id}"
+
+        header = f"{detection.update} det_id:{det_id} to {person_info}({track_info}) sim:{detection.confidence:.3f}"
+        info1 = f"euc_dist:{detection.is_valid_dist if hasattr(detection, 'is_valid_dist') else 'N/A'}({detection.euc_dist:.3f}) {detection.euc_dist_min if hasattr(detection, 'euc_dist_min') else 'N/A':.3f} < {detection.euc_dist:.3f} < {detection.euc_dist_max if hasattr(detection, 'euc_dist_max') else 'N/A':.3f}({detection.box_w:.3f}) euc_dist_mean:{detection.euc_dist_mean if hasattr(detection, 'euc_dist_mean') else 'N/A':.3f} euc_dist_std:{detection.euc_dist_std if hasattr(detection, 'euc_dist_std') else 'N/A':.3f}"
         ##info2 = f"mah_dist:{detection.is_valid_mah_dist}({detection.mah_dist:.3f})"
         info3 = f"bbox center:{detection.center} box_iou:{detection.box_iou:.3f}"
-        info4 = f"track:{self.tracks[detection.track_id].__dict__}"
+        # Avoid accessing track.__dict__ if track_id is -1 or invalid
+        track_stats_info = 'N/A'
+        if detection.track_id != -1 and detection.track_id is not None and detection.track_id < len(self.tracks):
+             track_stats_info = self.tracks[detection.track_id].stats
+        info4 = f"track_stats:{track_stats_info}"
+
         ##logger.info(f"{frame_id} {header} {info1} {info2} {info3} {info4}")
         logger.info(f"{frame_id} {header} {info1} {info3} {info4}")

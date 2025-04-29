@@ -165,7 +165,7 @@ def gen():
                  continue
 
             # Draw Center Box (Call remains here)
-            processed_frame = draw_center_box(processed_frame, box_size=250)
+            # processed_frame = draw_center_box(processed_frame, box_size=250)
 
             ret, jpeg = cv2.imencode(".jpg", processed_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ret:
