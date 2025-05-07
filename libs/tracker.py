@@ -50,14 +50,8 @@ DELETED = 3
 # Dictionary to track which IDs should be green
 green_tagged_ids = set()
 
-# Define the expected MQTT payloads and their corresponding section indices
-PAYLOAD_SECTION_MAP = {
-    "201010#Sudharsan#3#12345678#0-3 feet": 0,
-    "201010#Sudharsan#3#12345678#3-6 feet": 1,
-    "201010#Sudharsan#3#12345678#6-9 feet": 2,
-    "201010#Sudharsan#3#12345678#9-12 feet": 3,
-}
-
+# Define the threshold for RSSI
+RSSI_THRESHOLD = -65
 
 # MQTT Callbacks
 def on_connect(client, userdata, flags, rc):
@@ -70,53 +64,106 @@ def on_message(client, userdata, msg):
     data = msg.payload.decode().strip()
     print(f"Received data: {data}")
 
-    # Check if the received data is one of the expected payloads
-    if data in PAYLOAD_SECTION_MAP:
-        print(f"Received expected payload: {data}")
+    # Expected payload format: <TicketStatusCount>#<UserName>#<TicketBackgroundColour>#<TicketId>#<TicketName>#<AverageRSSI>
+    # Example: 201010#Sudharsan#3#12345678#Student#-61
+    payload_parts = data.split('#')
 
-        # Get the corresponding section index from the map
-        target_section_index = PAYLOAD_SECTION_MAP[data]
+    # Check if the payload has the expected number of parts (6) and starts with "201010"
+    if len(payload_parts) == 6 and payload_parts[0] == "201001":
+        try:
+            # Extract the AverageRSSI value (last part) and convert to float
+            average_rssi = float(payload_parts[5])
+            print(f"Parsed AverageRSSI: {average_rssi}")
 
-        # Access the tracker instance correctly
-        tracker = userdata['tracker']
+            # Access the tracker instance correctly
+            tracker = userdata['tracker']
 
-        # Get the segment width calculated by the tracker
-        segment_width = tracker.segment_width
-        frame_w = tracker.frame_w
+            # Get the segment width calculated by the tracker (based on 4 visual sections)
+            segment_width = tracker.segment_width
+            frame_w = tracker.frame_w
 
-        # Calculate the x-coordinate range for the target section
-        min_x = target_section_index * segment_width
-        # The max_x for the last section should go up to the frame width
-        max_x = (target_section_index + 1) * segment_width
-        if target_section_index == tracker.num_distance_sections - 1: # Check if it's the last section
-             max_x = frame_w
+            # Define the boundaries for the two logical sections (based on 4 visual sections)
+            # Section 1 (0-6 feet) corresponds to the first two visual sections (0 to 2*segment_width)
+            min_x_section1 = 0
+            max_x_section1 = 2 * segment_width
 
-        print(f"Checking for persons in section index {target_section_index} (x range: {min_x} to {max_x})")
+            # Section 2 (6-12 feet) corresponds to the last two visual sections (2*segment_width to frame_w)
+            min_x_section2 = 2 * segment_width
+            max_x_section2 = frame_w
 
-        # Iterate through all active tracks
-        for track in tracker.tracks:
-            # Only consider confirmed tracks that have been assigned an ID
-            if track.stats == CONFIRMED and track.person_id is not None:
-                # Get the last known position of the track
-                # Ensure track_points is not empty
-                if tracker.track_points[track.track_id]:
-                    center = tracker.track_points[track.track_id][-1] # (x, y) coordinate
+            # Determine the target logical section based on RSSI
+            target_min_x = None
+            target_max_x = None
+            target_section_name = "None"
 
-                    # Check if the person's center is inside the target section
-                    # The x-coordinate must be within the calculated range (inclusive)
-                    if min_x <= center[0] <= max_x:
-                        # Condition 1: Person is in the correct section
-                        # Condition 2: MQTT payload matched (checked by the outer if)
+            if average_rssi > RSSI_THRESHOLD:
+                # RSSI > -65 means target is Logical Section 1 (0-6 feet)
+                target_min_x = min_x_section1
+                target_max_x = max_x_section1
+                target_section_name = "0-6 feet"
+                print(f"RSSI ({average_rssi}) > {RSSI_THRESHOLD}. Target logical section: {target_section_name} (x range: {target_min_x} to {target_max_x})")
+            else:
+                # RSSI <= -65 means target is Logical Section 2 (6-12 feet)
+                target_min_x = min_x_section2
+                target_max_x = max_x_section2
+                target_section_name = "6-12 feet"
+                print(f"RSSI ({average_rssi}) <= {RSSI_THRESHOLD}. Target logical section: {target_section_name} (x range: {target_min_x} to {target_max_x})")
 
-                        # If both conditions are met, tag this person ID as green
-                        green_tagged_ids.add(track.person_id)
-                        print(f"Person ID {track.person_id} tagged as GREEN (in section {target_section_index} and MQTT matched)")
+            # If a target section was determined
+            if target_min_x is not None:
+                # Collect all confirmed persons currently inside the target logical section
+                matching_persons_in_section = [] # List to store (x_coordinate, person_id)
+
+                print("Checking confirmed tracks for presence in target section...")
+                for track in tracker.tracks:
+                    # Only consider confirmed tracks that have been assigned an ID
+                    if track.stats == CONFIRMED and track.person_id is not None:
+                        # Get the last known position of the track
+                        # Ensure track_points is not empty
+                        if tracker.track_points[track.track_id]:
+                            center = tracker.track_points[track.track_id][-1] # (x, y) coordinate
+                            person_x = center[0]
+
+                            # Check if the person's center is inside the target logical section
+                            if target_min_x <= person_x <= target_max_x:
+                                # This person is in the correct section based on RSSI
+                                matching_persons_in_section.append((person_x, track.person_id))
+                                print(f" - Person ID {track.person_id} at x={person_x:.2f} IS inside {target_section_name}.")
+                            else:
+                                print(f" - Person ID {track.person_id} at x={person_x:.2f} is NOT inside {target_section_name}.")
+                        else:
+                             print(f" - Track {track.track_id} (Person ID {track.person_id}) has no track points.")
                     # else:
-                    #     print(f"Person ID {track.person_id} is NOT inside the target section ({target_section_index})")
-                # else:
-                #      print(f"Track {track.track_id} has no track points.")
+                    #      print(f" - Track {track.track_id} is not CONFIRMED or has no person_id.")
+
+
+                # Now, find the leftmost person among the matching ones
+                if matching_persons_in_section:
+                    print(f"Found {len(matching_persons_in_section)} person(s) in {target_section_name}: {matching_persons_in_section}")
+                    # Sort the list by the x-coordinate (the first element of the tuple)
+                    # This puts the leftmost person first.
+                    matching_persons_in_section.sort()
+
+                    # The leftmost person is the first one in the sorted list
+                    leftmost_person_x, leftmost_person_id = matching_persons_in_section[0]
+
+                    # Tag ONLY the leftmost person's ID as green
+                    # This handles both the single person case (they are the leftmost)
+                    # and the multiple person case (picks the actual leftmost).
+                    green_tagged_ids.add(leftmost_person_id)
+                    print(f"Leftmost person in {target_section_name} is ID {leftmost_person_id} at x={leftmost_person_x:.2f}. Tagging GREEN.")
+                else:
+                    print(f"No confirmed persons found inside the target logical section ({target_section_name}).")
+
+            else:
+                 print("No target logical section determined based on RSSI.")
+
+        except ValueError:
+            print(f"Could not parse AverageRSSI from payload: {data}")
+        except Exception as e:
+            print(f"An error occurred processing MQTT message: {e}")
     # else:
-    #     print(f"Received unexpected payload: {data}")
+    #     print(f"Received payload does not match expected format or start: {data}")
 
 
 # MQTT Initialization
@@ -192,8 +239,8 @@ class Tracker:
         self.track_range = self._set_track_range(frame, self.grid)
         self.m = Munkres()
 
-        # Calculate and store segment width for distance lines
-        self.num_distance_sections = 4 # 0-3, 3-6, 6-9, 9-12
+        # Calculate and store segment width for distance lines (based on 4 visual sections)
+        self.num_distance_sections = 4 # 0-3, 3-6, 6-9, 9-12 (for labels/invisible lines)
         self.segment_width = self.frame_w // self.num_distance_sections
 
 
@@ -512,7 +559,7 @@ class Tracker:
     def draw_distance_lines(self, frame):
         """Draws 3 vertical lines (invisibly) and distance labels for 4 sections on the frame."""
         frame_h, frame_w = frame.shape[:2]
-        num_sections = self.num_distance_sections # Use the stored attribute
+        num_sections = self.num_distance_sections # Use the stored attribute (4)
         num_lines = num_sections - 1 # This means 3 lines
         segment_width = self.segment_width # Use the stored attribute
 
